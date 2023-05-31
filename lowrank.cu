@@ -41,11 +41,4 @@ void multiply_low_rank_matrix_cuda(torch::Tensor A, torch::Tensor B, torch::Tens
         vector.packed_accessor<scalar_t,1,torch::RestrictPtrTraits>(),
         result.packed_accessor<scalar_t,1,torch::RestrictPtrTraits>());
   }));
-
-  // Template free version
-  //multiply_low_rank_matrix_cuda_kernel<<<blocks, threads>>>(
-  //    A.packed_accessor<float,2,torch::RestrictPtrTraits>(),
-  //    B.packed_accessor<float,2,torch::RestrictPtrTraits>(),
-  //    vector.packed_accessor<float,1,torch::RestrictPtrTraits>(),
-  //    result.packed_accessor<float,1,torch::RestrictPtrTraits>());
 }
