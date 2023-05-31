@@ -33,6 +33,35 @@ void gram_schmidt_inplace(at::Tensor& X) {
 }
 
 
+at::Tensor subspace_iteration(at::Tensor Ut, at::Tensor diag, at::Tensor W, int niter) {
+   // Computes the lowrank + diag decomposition of W (UU^T + diag) W^T.
+   int k = U.size(0);
+   int d0 = U.size(1);
+   int d1 = W.size(0);
+
+   auto WDWt = (W * diag).mm(W.t());
+   auto WU = W.mm(Ut.t());
+   auto WUUtWt = WU.mm(WU.t());
+   auto M = WDWt + WUUtWt;
+   auto Md = M.diag();
+   auto D = Md.clone();
+
+   at::Tensor Vt = at::randn({k, d1}, U.options());
+   for (int i = 0; i < niter; i++) {
+      // If we use normalized gram schmidt, it seems these will all just be one...
+      S = Vt.norm(2, 1); // L2 norm of each row
+      // There seems to be some double work going on here...
+      D = Md - (Vt * Vt / S).sum(1);
+      D.clamp_min_(0);
+      if (i + 1 != niter) {
+         Vt /= S;
+         Vt = Vt.mm((M - D).t());
+         // The paper actually calls for "un-normalized gram schmidt"
+         gram_schmidt_inplace(Vt);
+      }
+   }
+   return {D, Vt / at::sqrt(S)};
+}
 
 at::Tensor subspace_iteration(at::Tensor A, int k, int num_iterations) {
    // What are we actually trying to do?
