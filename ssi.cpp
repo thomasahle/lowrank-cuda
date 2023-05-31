@@ -4,63 +4,151 @@
 
 void modified_gram_schmidt_inplace(at::Tensor& X) {
    // Orthogonalize and normalize the rows of X
-   size_t n = X.size(0);
-   for (size_t i = 0; i < n; ++i) {
-      X.select(0, i) /= X.select(0, i).norm().item<float>();
+   int64_t n = X.size(0);
+   at::Tensor proj = at::empty({n}, X.options());
+   for (int64_t i = 0; i < n; ++i) {
+      auto v = X.select(0, i);
+      // We could decide to not normalize v here, and divide everything
+      // in the next bit by the norm instead.
+      v /= v.norm().item<float>();
       // Calculate the projection of all future vectors onto X[i]
       if (i + 1 != n) {
           // Calculate the projections of all future vectors onto the current vector
-          auto proj = X.slice(0, i + 1, n).mv(X.select(0, i));
+          // auto proj = X.slice(0, i + 1, n).mv(v);
+          // See if we can reuse the memory
+          proj.resize_({n - i - 1});
+          at::mv_out(proj, X.slice(0, i + 1, n), v);
           // Subtract the projection from the future vectors
-          // X.slice(0, i + 1, n) -= proj.unsqueeze(1) * X.select(0, i); but in-place
-          X.slice(0, i + 1, n).addr_(proj, X.select(0, i), -1.0);
+          // X.slice(0, i + 1, n) -= proj.unsqueeze(1) * v; but in-place
+          X.slice(0, i + 1, n).addr_(proj, v, -1.0);
       }
    }
 }
+
+void unnormalized_modified_gram_schmidt_inplace(at::Tensor& X) {
+   // Orthogonalize and normalize the rows of X
+   int64_t n = X.size(0);
+   at::Tensor proj = at::empty({n}, X.options());
+   for (int64_t i = 0; i < n; ++i) {
+      auto v = X.select(0, i);
+      // We could decide to not normalize v here, and divide everything
+      // in the next bit by the norm instead.
+      auto norm2 = (v * v).sum();
+      // Calculate the projection of all future vectors onto X[i]
+      if (i + 1 != n) {
+          // Calculate the projections of all future vectors onto the current vector
+          // auto proj = X.slice(0, i + 1, n).mv(v);
+          // Trying to reuse the memory...
+          proj.resize_({n - i - 1});
+          at::mv_out(proj, X.slice(0, i + 1, n), v);
+          proj /= norm2;
+          // Subtract the projection from the future vectors
+          // X.slice(0, i + 1, n) -= proj.unsqueeze(1) * v; but in-place
+          X.slice(0, i + 1, n).addr_(proj, v, -1.0);
+      }
+   }
+}
+
 
 void gram_schmidt_inplace(at::Tensor& X) {
    // Orthogonalize and normalize the rows of X
    for (size_t i = 0; i < X.size(0); ++i) {
+      auto v = X.select(0, i);
       if (i != 0) {
          // Calculate the projection of the current vector onto all previous vectors
-         auto proj = X.slice(0, 0, i).mv(X.select(0, i));
+         auto proj = X.slice(0, 0, i).mv(v);
          // Subtract the projection from the current vector
-         // X.select(0, i) -= X.slice(0, 0, i).t().mv(proj); but in-place
-         X.select(0, i).addmv_(X.slice(0, 0, i).t(), proj, -1.0);
+         // v -= X.slice(0, 0, i).t().mv(proj); but in-place
+         v.addmv_(X.slice(0, 0, i).t(), proj, -1.0);
       }
-      X.select(0, i) /= X.select(0, i).norm().item<float>();
+      v /= v.norm().item<float>();
    }
 }
 
-
-at::Tensor subspace_iteration(at::Tensor Ut, at::Tensor diag, at::Tensor W, int niter) {
+std::tuple<at::Tensor, at::Tensor> fast_dplr(at::Tensor Ut, at::Tensor diag, at::Tensor W, int niter) {
    // Computes the lowrank + diag decomposition of W (UU^T + diag) W^T.
-   int k = U.size(0);
-   int d0 = U.size(1);
+   int k = Ut.size(0);
+   int d0 = Ut.size(1);
    int d1 = W.size(0);
 
+   //std::cout << "A" << std::endl;
+
+   //auto WDWt = (W * diag.unsqueeze(1)).mm(W.t());
    auto WDWt = (W * diag).mm(W.t());
    auto WU = W.mm(Ut.t());
    auto WUUtWt = WU.mm(WU.t());
+   // Maybe we don't even want to compute the full M?
    auto M = WDWt + WUUtWt;
    auto Md = M.diag();
-   auto D = Md.clone();
 
-   at::Tensor Vt = at::randn({k, d1}, U.options());
+   //std::cout << "B" << std::endl;
+
+   at::Tensor D = Md.clone();
+   at::Tensor S;
+   at::Tensor Vt = at::randn({k, d1}, Ut.options());
+
+   // This is the version that actually makes sense.
+   // It's just a bit slower than the others...
+   at::Tensor VtMt = Vt.clone();
+   if (false)
    for (int i = 0; i < niter; i++) {
-      // If we use normalized gram schmidt, it seems these will all just be one...
-      S = Vt.norm(2, 1); // L2 norm of each row
-      // There seems to be some double work going on here...
-      D = Md - (Vt * Vt / S).sum(1);
+      // If I don't do GS every iteration, my rows are not unit-norm, which I expect below
+      //if (i % 2 == 0 || i + 1 == niter)
+      // GS could return the norms, but with the current code ordering that wouldn't work,
+      // since what we want is the norms after multiplying with M.
+      //modified_gram_schmidt_inplace(Vt);
+      // Somehow this unnormalized version is faster...
+      unnormalized_modified_gram_schmidt_inplace(Vt);
+      Vt /= Vt.norm(2, 1).unsqueeze(1);
+
+      // Vt = Vt @ (M - D). The rest is commentary.
+      //auto VtMt = Vt.mm((M - D.diag()).t());
+      //VtMt.copy_(Vt.mm((M - D.diag()).t()));
+      VtMt = Vt.mm((M - D.diag()).t());
+      //at::mm_out(VtMt, Vt, (M - D.diag()).t());
+      // We could maybe improve this by not even computing M outside the loop,
+      // but dicretly computing Vt (WDWt + WUUtWt) here. Though it would only be
+      // smart if we are doing few iterations (which we are).
+      //at::mm_out(VtMt, Vt, M.t());  // VtMt = Vt.mm(M.t())
+      // This is still allocating.
+      //VtMt.sub_(Vt * D);  // VtMt -= Vt * D
+
+      // Update the diagonal approximation
+      // auto S2 = VtMt.mm(VtMt.t()).diag();  // (MV)^T MV = V^T (U S V^T)^T (U S V^T) V = S^2
+      // S = at::sqrt(S2);
+      S = VtMt.norm(2, 1); // column norms of Vt
+      //assert(S.size(0) == k);
+      // Might as well do this even in the last loop?
+      //D = Md - (Vt.t() * S).mm(Vt).diag();
+      D = Md - (Vt * Vt).t().mv(S);
       D.clamp_min_(0);
       if (i + 1 != niter) {
-         Vt /= S;
-         Vt = Vt.mm((M - D).t());
-         // The paper actually calls for "un-normalized gram schmidt"
-         gram_schmidt_inplace(Vt);
+         // Update Vt in the normal supspace iteration way
+         Vt = VtMt;
+         //Vt.copy_(VtMt);
       }
    }
-   return {D, Vt / at::sqrt(S)};
+
+   // This is the version in the paper, which uses unormalized GS.
+   // The advantage is that it only requires computing the norm once.
+   if (false)
+   for (int i = 0; i < niter; i++) {
+      // The paper actually calls for "un-normalized gram schmidt"
+      unnormalized_modified_gram_schmidt_inplace(Vt);
+      // If we use normalized gram schmidt, it seems these will all just be one...
+      S = Vt.norm(2, 1); // L2 norm of each row
+      assert(S.size(0) == k);
+      Vt /= S.unsqueeze(1);
+      // There seems to be some double work going on here...
+      D = Md - (Vt * Vt * S.unsqueeze(1)).sum(0);
+      assert(D.size(0) == d1);
+      D.clamp_min_(0);
+      if (i + 1 != niter) {
+         Vt = Vt.mm((M - D.diag()).t());
+      }
+   }
+   // We put just half of the diagonal, S, in Vt, since the full matrix is VV^T
+   return {D, Vt * at::sqrt(S).unsqueeze(1)};
 }
 
 at::Tensor subspace_iteration(at::Tensor A, int k, int num_iterations) {
@@ -101,6 +189,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> svd_right(at::Tensor A, int k, in
    at::Tensor AtA = A.t().mm(A);
    auto Vt = subspace_iteration(AtA, k, num_iterations);
    auto AV = A.mm(Vt.t());
+   // FIXME: It's obviously inefficient to compute the whole AV(AV)^T product
+   // if I only need the diagonal
    auto Rt = AV.t().mm(AV).diag();
    auto Sigma = at::sqrt(Rt);
    auto U = AV / Sigma;
@@ -146,5 +236,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
    m.def("svd_left2", &svd_left2, "SVD (ATen)");
    m.def("svd_right", &svd_right, "SVD (ATen)");
    m.def("svd_right2", &svd_right2, "SVD (ATen)");
+   m.def("fast_dplr", &fast_dplr, "Fast DPLR Decomposition (ATen)");
    //m.def("svd", &svd, "SVD (ATen)");
 }
